@@ -1,12 +1,11 @@
-use std::{cell::RefCell, rc::Rc, sync::Mutex};
+use std::{cell::RefCell, rc::Rc};
 
 use pipewire::{
     self as pw,
-    node::Node,
-    spa::{
-        pod::deserialize::PodDeserializer,
-        utils::{dict::DictRef, result::AsyncSeq},
-    },
+    metadata::{Metadata, MetadataListener},
+    node::{Node, NodeListener},
+    proxy::ProxyT,
+    spa::utils::result::AsyncSeq,
 };
 
 #[derive(Clone, Debug)]
@@ -28,7 +27,40 @@ pub struct Device {
 
 impl Device {}
 
-fn roundtrip() -> Option<Vec<Device>> {
+#[derive(Debug, Clone, Default)]
+struct Settings {
+    rate: u32,
+    allow_rates: Vec<u32>,
+    quantum: u32,
+    min_quantum: u32,
+    max_quantum: u32,
+}
+
+#[allow(dead_code)]
+enum Request {
+    Node(NodeListener),
+    Meta(MetadataListener),
+}
+
+impl From<NodeListener> for Request {
+    fn from(value: NodeListener) -> Self {
+        Self::Node(value)
+    }
+}
+
+impl From<MetadataListener> for Request {
+    fn from(value: MetadataListener) -> Self {
+        Self::Meta(value)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct InitResult {
+    devices: Vec<Device>,
+    settings: Settings,
+}
+
+fn init_roundtrip() -> Option<InitResult> {
     let mainloop = pw::main_loop::MainLoopRc::new(None).ok()?;
     let context = pw::context::ContextRc::new(&mainloop, None).ok()?;
     let core = context.connect_rc(None).ok()?;
@@ -36,7 +68,8 @@ fn roundtrip() -> Option<Vec<Device>> {
 
     // To comply with Rust's safety rules, we wrap this variable in an `Rc` and  a `Cell`.
     let devices: Rc<RefCell<Vec<Device>>> = Rc::new(RefCell::new(vec![]));
-    let requests = Rc::new(Mutex::new(vec![]));
+    let requests = Rc::new(RefCell::new(vec![]));
+    let settings = Rc::new(RefCell::new(Settings::default()));
     let loop_clone = mainloop.clone();
 
     // Trigger the sync event. The server's answer won't be processed until we start the main loop,
@@ -71,8 +104,76 @@ fn roundtrip() -> Option<Vec<Device>> {
         .global({
             let devices = devices.clone();
             let registry = registry.clone();
-            let settings = requests.clone();
+            let requests = requests.clone();
+            let settings = settings.clone();
             move |global| match global.type_ {
+                pipewire::types::ObjectType::Metadata => {
+                    if !global.props.is_some_and(|props| {
+                        props
+                            .get("metadata.name")
+                            .is_some_and(|name| name == "settings")
+                    }) {
+                        return;
+                    }
+                    let meta_settings: Metadata = registry.bind(global).unwrap();
+                    let settings = settings.clone();
+                    let listener = meta_settings
+                        .add_listener_local()
+                        .property(move |_, key, _, value| {
+                            match (key, value) {
+                                (Some("clock.rate"), Some(rate)) => {
+                                    let Ok(rate) = rate.parse() else {
+                                        return 0;
+                                    };
+                                    settings.borrow_mut().rate = rate;
+                                }
+                                (Some("clock.allowed-rates"), Some(list)) => {
+                                    let Some(list) = list.strip_prefix("[") else {
+                                        return 0;
+                                    };
+                                    let Some(list) = list.strip_suffix("]") else {
+                                        return 0;
+                                    };
+                                    let list = list.trim();
+                                    let list: Vec<&str> = list.split(' ').collect();
+                                    let mut allow_rates = vec![];
+                                    for rate in list {
+                                        let Ok(rate) = rate.parse() else {
+                                            return 0;
+                                        };
+                                        allow_rates.push(rate);
+                                    }
+                                    settings.borrow_mut().allow_rates = allow_rates;
+                                }
+                                (Some("clock.quantum"), Some(quantum)) => {
+                                    let Ok(quantum) = quantum.parse() else {
+                                        return 0;
+                                    };
+                                    settings.borrow_mut().quantum = quantum;
+                                }
+                                (Some("clock.min-quantum"), Some(min_quantum)) => {
+                                    let Ok(min_quantum) = min_quantum.parse() else {
+                                        return 0;
+                                    };
+                                    settings.borrow_mut().min_quantum = min_quantum;
+                                }
+                                (Some("clock.max-quantum"), Some(max_quantum)) => {
+                                    let Ok(max_quantum) = max_quantum.parse() else {
+                                        return 0;
+                                    };
+                                    settings.borrow_mut().max_quantum = max_quantum;
+                                }
+                                _ => {}
+                            }
+                            0
+                        })
+                        .register();
+                    let pending = core.sync(0).expect("sync failed");
+                    peddings.borrow_mut().push(pending);
+                    requests
+                        .borrow_mut()
+                        .push((meta_settings.upcast(), Request::Meta(listener)));
+                }
                 pipewire::types::ObjectType::Node => {
                     let Some(props) = global.props else {
                         return;
@@ -96,7 +197,6 @@ fn roundtrip() -> Option<Vec<Device>> {
                             let Some(props) = info.props() else {
                                 return;
                             };
-                            dbg!(props);
                             let Some(media_class) = props.get("media.class") else {
                                 return;
                             };
@@ -136,7 +236,9 @@ fn roundtrip() -> Option<Vec<Device>> {
                         .register();
                     let pending = core.sync(0).expect("sync failed");
                     peddings.borrow_mut().push(pending);
-                    settings.lock().unwrap().push((node, listener));
+                    requests
+                        .borrow_mut()
+                        .push((node.upcast(), Request::Node(listener)));
                 }
                 _ => {}
             }
@@ -145,14 +247,16 @@ fn roundtrip() -> Option<Vec<Device>> {
 
     mainloop.run();
 
-    let devices = devices.borrow().clone();
-    Some(devices)
+    let devices = devices.take();
+    let settings = settings.take();
+    Some(InitResult { devices, settings })
 }
 
 fn main() {
     pw::init();
-    let devices = roundtrip().unwrap();
+    let InitResult { devices, settings } = init_roundtrip().unwrap();
     println!("devices {devices:?}");
+    println!("settings {settings:?}");
     unsafe {
         pw::deinit();
     }
