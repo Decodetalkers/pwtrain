@@ -8,13 +8,14 @@ use pipewire::{
     spa::utils::result::AsyncSeq,
 };
 
-#[derive(Clone, Debug)]
-enum Direction {
+#[derive(Clone, Debug, Copy, Default)]
+pub enum Direction {
+    #[default]
     Input,
     Output,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Device {
     id: u32,
     node_name: String,
@@ -22,10 +23,52 @@ pub struct Device {
     description: String,
     direction: Direction,
     channels: usize,
-    buffer_limit: u32,
+    limit_quantum: u32,
+    rate: u32,
+    allow_rates: Vec<u32>,
+    quantum: u32,
+    min_quantum: u32,
+    max_quantum: u32,
 }
 
-impl Device {}
+impl Device {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+    pub fn name(&self) -> &str {
+        &self.nick_name
+    }
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+    pub fn direction(&self) -> Direction {
+        self.direction
+    }
+    pub fn node_name(&self) -> &str {
+        &self.node_name
+    }
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+    pub fn limit_quantam(&self) -> u32 {
+        self.limit_quantum
+    }
+    pub fn min_quantum(&self) -> u32 {
+        self.min_quantum
+    }
+    pub fn max_quantum(&self) -> u32 {
+        self.max_quantum
+    }
+    pub fn quantum(&self) -> u32 {
+        self.quantum
+    }
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+    pub fn allow_rates(&self) -> &[u32] {
+        &self.allow_rates
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct Settings {
@@ -54,13 +97,7 @@ impl From<MetadataListener> for Request {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct InitResult {
-    devices: Vec<Device>,
-    settings: Settings,
-}
-
-fn init_roundtrip() -> Option<InitResult> {
+fn init_roundtrip() -> Option<Vec<Device>> {
     let mainloop = pw::main_loop::MainLoopRc::new(None).ok()?;
     let context = pw::context::ContextRc::new(&mainloop, None).ok()?;
     let core = context.connect_rc(None).ok()?;
@@ -218,7 +255,7 @@ fn init_roundtrip() -> Option<InitResult> {
                                 .get("audio.channels")
                                 .and_then(|channels| channels.parse().ok())
                                 .unwrap_or(2);
-                            let buffer_limit: u32 = props
+                            let limit_quantum: u32 = props
                                 .get("clock.quantum-limit")
                                 .and_then(|channels| channels.parse().ok())
                                 .unwrap_or(0);
@@ -229,7 +266,8 @@ fn init_roundtrip() -> Option<InitResult> {
                                 description,
                                 direction,
                                 channels,
-                                buffer_limit,
+                                limit_quantum,
+                                ..Default::default()
                             };
                             devices.borrow_mut().push(device);
                         })
@@ -247,16 +285,22 @@ fn init_roundtrip() -> Option<InitResult> {
 
     mainloop.run();
 
-    let devices = devices.take();
+    let mut devices = devices.take();
     let settings = settings.take();
-    Some(InitResult { devices, settings })
+    for device in devices.iter_mut() {
+        device.rate = settings.rate;
+        device.allow_rates = settings.allow_rates.clone();
+        device.quantum = settings.quantum;
+        device.min_quantum = settings.min_quantum;
+        device.max_quantum = settings.max_quantum;
+    }
+    Some(devices)
 }
 
 fn main() {
     pw::init();
-    let InitResult { devices, settings } = init_roundtrip().unwrap();
+    let devices = init_roundtrip().unwrap();
     println!("devices {devices:?}");
-    println!("settings {settings:?}");
     unsafe {
         pw::deinit();
     }
