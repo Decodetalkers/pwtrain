@@ -231,6 +231,7 @@ fn init_roundtrip() -> Option<Vec<Device>> {
                     let listener = node
                         .add_listener_local()
                         .info(move |info| {
+                            dbg!(info);
                             let Some(props) = info.props() else {
                                 return;
                             };
